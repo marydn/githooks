@@ -46,6 +46,17 @@
             "cache:clear": "symfony-cmd",
             "assets:install %PUBLIC_DIR%": "symfony-cmd"
         },
+        "check-git-config": [
+            "chmod -R +x .dotfiles/git/hooks/*",
+            "git config --local include.path .dotfiles/git/.gitconfig",
+            "git config --local core.hooksPath .dotfiles/git/hooks"
+        ],
+        "pre-install-cmd": [
+            "@check-git-config"
+        ],
+        "pre-update-cmd": [
+            "@check-git-config"
+        ],
         "post-install-cmd": [
             "@auto-scripts"
         ],
