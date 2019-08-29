@@ -1,0 +1,373 @@
+#!/usr/bin/php
+<?php
+
+require __DIR__ . '/../../../vendor/autoload.php';
+
+use Symfony\Component\Console\{
+    Application,
+    Formatter\OutputFormatterStyle,
+    Input\InputInterface,
+    Output\OutputInterface
+};
+use Symfony\Component\Process\{
+    Exception\ProcessFailedException, 
+    Process
+};
+
+/**
+ * Class CodeQualityTool
+ *
+ * @author Mary De Nóbrega <denobrega.mary@gmail.com>
+ */
+class CodeQualityTool extends Application
+{
+    const TERMINAL_WIDTH = 100;
+    const PHP_FILES_IN_SRC = '/^src\/(.*)(\.php)$/';
+
+    // Downcased letters are used to exclude
+    const STATUS_FILE_ADDED          = 'A';
+    const STATUS_FILE_PAIRING_BROKEN = 'B';
+    const STATUS_FILE_COPIED         = 'C';
+    const STATUS_FILE_DELETED        = 'D';
+    const STATUS_FILE_MODIFIED       = 'M';
+    const STATUS_FILE_RENAMED        = 'R';
+    const STATUS_FILE_TYPE           = 'T';
+    const STATUS_FILE_UNMERGED       = 'U';
+    const STATUS_FILE_UNKNOWN        = 'X';
+    const STATUS_ALL_FILES           = '*';
+
+    const STATUS_FILES_ALLOWED = array(
+        self::STATUS_FILE_ADDED,
+        self::STATUS_FILE_MODIFIED
+    );
+
+    /** @var InputInterface */
+    private $input;
+
+    /** @var OutputInterface */
+    private $output;
+
+    /** @var string */
+    private $workingPath;
+
+    /** @var array */
+    private $files = array();
+
+    /** @var array */
+    private $phpFiles = array();
+
+    /** @var bool */
+    private $hasFailed = false;
+
+    /**
+     * @param InputInterface  $input
+     * @param OutputInterface $output
+     *
+     * @return int|void
+     */
+    public function doRun(InputInterface $input, OutputInterface $output)
+    {
+        $this->initialize($input, $output);
+
+        $titleApp = str_pad($this->getName(), 80-strlen($this->getName()), ' ', STR_PAD_BOTH);
+
+        $output->writeln(array(
+            sprintf("<title>%s</title>", $titleApp),
+            sprintf('Version %s', $this->getVersion()),
+        ));
+
+        $output->writeln('');
+        $output->writeln('<task>Fetching committed files...</task>');
+        $this->files    = $this->getCommittedFiles();
+        $this->phpFiles = $this->extractPhpFiles();
+        $output->writeln('<finished>...Done!</finished>');
+
+        $output->writeln('');
+        $output->writeln('<task>Check composer.json and composer.lock...</task>');
+        $this->checkComposer();
+        $output->writeln('<finished>...Done!</finished>');
+
+        if (count($this->phpFiles)) {
+            $output->writeln('');
+            $output->writeln('<task>Running PHP Linter...</task>');
+            $this->phpLint();
+            $output->writeln('<finished>...Done!</finished>');
+
+            $output->writeln('');
+            $output->writeln('<task>Checking code style with PHP CS Fixer...</task>');
+            $this->phpCsFixer();
+            $output->writeln('<finished>...Done!</finished>');
+
+            $output->writeln('');
+            $output->writeln('<task>Checking code style with PHP Code Sniffer...</task>');
+            $this->phpCodeSniffer();
+            $output->writeln('<finished>...Done!</finished>');
+
+            $output->writeln('');
+            $output->writeln('<task>Checking code mess with PHP Mess Detector...</task>');
+            $this->phpMessDetector();
+            $output->writeln('<finished>...Done!</finished>');
+
+            $output->writeln('');
+            $output->writeln('<task>Running unit tests...</task>');
+            $this->phpunit();
+            $output->writeln('<finished>...Done!</finished>');
+        } else {
+            $output->writeln('');
+            $output->writeln('<task>No PHP files added to commit...</task>');
+            $output->writeln('...Skipping unnecessary PHP checkings.');
+        }
+
+        if (true === $this->hasFailed) {
+            $this->output->writeln('');
+            $this->output->writeln('<comment>Fix those files to continue with the committing thing...</comment>');
+            $this->output->writeln('');
+
+            exit(1);
+        }
+
+        $output->writeln('');
+        $output->writeln('<finished>Good job!</finished>');
+        $output->writeln('');
+        $output->writeln('<comment>...Continuing with GIT commit...</comment>');
+        $output->writeln('');
+    }
+
+    /**
+     * @return array
+     */
+    private function getCommittedFiles(): array
+    {
+        $process = $this->executeProcess(array('git', 'rev-parse', '--verify', 'HEAD'));
+        $process->run();
+
+        $against    = $process->isSuccessful() ? trim($process->getOutput()) : 'HEAD';
+        $diffFilter = join('', self::STATUS_FILES_ALLOWED);
+
+        $process2 = $this->executeProcess(array('git', 'diff-index', '--cached', '--name-only', '--diff-filter', $diffFilter, $against));
+        $process2->run();
+
+        if (!$process2->isSuccessful()) {
+            throw new ProcessFailedException($process2);
+        }
+
+        $cleanOutput = str_replace(array("\r", "\n", "   "),' ', trim($process2->getOutput()));
+        $cleanOutput = explode(' ', $cleanOutput);
+        $cleanOutput = array_filter($cleanOutput);
+
+        return $cleanOutput;
+    }
+
+    /**
+     * @return array
+     */
+    private function extractPhpFiles(): array
+    {
+        $cleanOutput = array_filter($this->files, function($file) {
+            return preg_match(self::PHP_FILES_IN_SRC, $file);
+        });
+
+        return $cleanOutput;
+    }
+
+    private function checkComposer()
+    {
+        $composerJsonDetected = array_search('composer.json', $this->files, true);
+        $composerLockDetected = array_search('composer.lock', $this->files, true);
+        if (false !== $composerJsonDetected && false === $composerLockDetected) {
+            $this->output->writeln(sprintf('<info>You are committing composer.json but not composer.lock.</info>'));
+        }
+    }
+
+    private function phpLint()
+    {
+        $fails = array();
+        foreach ($this->phpFiles as $file) {
+            $commands = array('php', '-l', $file);
+            $process = $this->executeProcess($commands);
+
+            try {
+                $process->mustRun();
+            } catch (ProcessFailedException $exception) {
+                $fails[$file] = $process->getOutput();
+            }
+        }
+
+        if (count($fails)) {
+            $this->output->writeln('<result>...PHP Linter has found some issues...</result>');
+            $this->printLog($fails);
+        }
+    }
+
+    /**
+     * @param string $configFile
+     */
+    private function phpCsFixer($configFile = '.php_cs')
+    {
+        $fails = array();
+        foreach ($this->phpFiles as $file) {
+            $commands = array(
+                'php', 'bin/php-cs-fixer',
+                'fix',
+                '--config='.$configFile,
+                '--dry-run',
+                '--verbose',
+                $file,
+            );
+
+            $process = $this->executeProcess($commands);
+
+            try {
+                $process->mustRun();
+            } catch (ProcessFailedException $exception) {
+                $fails[$file] = $process->getOutput();
+            }
+        }
+
+        if (count($fails)) {
+            $this->output->writeln('<result>...PHP CS Fixer has found some issues...</result>');
+            $this->printLog($fails);
+        }
+    }
+
+    /**
+     * @param string $configFile
+     */
+    private function phpCodeSniffer($configFile = 'phpcs.xml.dist')
+    {
+        $fails = array();
+        foreach ($this->phpFiles as $file) {
+            $commands = array(
+                'php', 'bin/phpcs',
+                '--standard='.$configFile,
+                '--report=summary',
+                '-q',
+                $file
+            );
+
+            $process = $this->executeProcess($commands);
+
+            try {
+                $process->mustRun();
+            } catch (ProcessFailedException $exception) {
+                $fails[$file] = $file.': '.$exception->getMessage();
+            }
+        }
+
+        if (count($fails)) {
+            $this->output->writeln('<result>...PHP Code Sniffer has found some issues...</result>');
+            $this->printLog($fails);
+        }
+    }
+
+    /**
+     * @param string $configFile
+     */
+    private function phpMessDetector($configFile = 'phpmd.xml.dist')
+    {
+        $fails = array();
+        foreach ($this->phpFiles as $file) {
+            $commands = array(
+                'php', 'bin/phpmd',
+                $file,
+                'text',
+                $configFile,
+                '--suffixes=php',
+                '--report-file=./output/build/php-mess-detector.txt'
+            );
+
+            $process = $this->executeProcess($commands);
+
+            try {
+                $process->mustRun();
+            } catch (ProcessFailedException $exception) {
+                $fails[$file] = $process->getOutput();
+            }
+        }
+
+        if (count($fails)) {
+            $this->output->writeln('<result>...PHP Mess Detector has found some issues...</result>');
+            $this->printLog($fails);
+        }
+    }
+
+    /**
+     * @param string $configFile
+     */
+    private function phpunit($configFile = 'phpunit.xml.dist')
+    {
+        $commands = array(
+            'php', 'bin/phpunit',
+            '--config='.$configFile,
+            '--log-junit=./output/build/junit-report.xml',
+            '--colors=always',
+            '--columns=80'
+        );
+
+        $process = $this->executeProcess($commands);
+        $process->mustRun(function($type, $buffer) {
+            if (Process::ERR === $type) {
+                $this->output->write(sprintf('<error>>>> ERR > %s</error>', $buffer));
+            } else {
+                $this->output->write(sprintf('<result>>>> OUT > %s</result>', $buffer));
+            }
+        });
+    }
+
+    /**
+     * @param array $commands
+     *
+     * @return Process
+     */
+    private function executeProcess(array $commands): Process
+    {
+        $process = new Process($commands);
+        $process->setWorkingDirectory($this->workingPath);
+        $process->setEnv(array('COLUMNS' => self::TERMINAL_WIDTH));
+        $process->setTimeout(3600);
+        $process->setIdleTimeout(60);
+
+        return $process;
+    }
+
+    /**
+     * @param InputInterface  $input
+     * @param OutputInterface $output
+     */
+    private function initialize(InputInterface $input, OutputInterface $output)
+    {
+        $formatter = $output->getFormatter();
+        $formatter->setStyle('title', new OutputFormatterStyle('white', 'cyan', array('bold')));
+        $formatter->setStyle('finished', new OutputFormatterStyle('default'));
+        $formatter->setStyle('result', new OutputFormatterStyle('cyan'));
+        $formatter->setStyle('err', new OutputFormatterStyle('green', 'default'));
+        $formatter->setStyle('task', new OutputFormatterStyle('yellow', null, array('underscore')));
+
+        $this->input       = $input;
+        $this->output      = $output;
+        $this->workingPath = realpath(__DIR__.'/../../../../');
+    }
+
+    /**
+     * @param array $fails
+     */
+    private function printLog(array $fails = array())
+    {
+        /**
+         * Flag to know 'git commit' has to be cancelled.
+         */
+        $this->hasFailed = true;
+
+        $this->output->writeln('');
+
+        foreach ($fails as $fail) {
+            $fail = '>>> ERR > '.str_replace(array("\r", "\n", "   "),' ', trim($fail));
+            $this->output->writeln(sprintf('<err>%s</err>', $fail));
+        }
+
+        $this->output->writeln('');
+    }
+}
+
+$console = new CodeQualityTool(' Code Quality Tool', '1.0.0');
+$console->run();
