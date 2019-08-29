@@ -345,7 +345,7 @@ class CodeQualityTool extends Application
 
         $this->input       = $input;
         $this->output      = $output;
-        $this->workingPath = realpath(__DIR__.'/../../../../');
+        $this->workingPath = realpath(__DIR__.'/../../../');
     }
 
     /**
